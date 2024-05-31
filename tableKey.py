@@ -1,25 +1,30 @@
 try:
-    import pyglet,pystray,fontTools,keyboard
+    import pyglet,pystray,fontTools,keyboard,PIL
 except:
     import pip
-    pip.main(['install','pyglet','pystray','fontTools','keyboard'])
-from tkinter import *
-from tkinter.ttk import *
-from tkinter import font
-import pyglet
-from fontTools.ttLib import TTFont
+    pip.main(['install','pyglet','pystray','fontTools','keyboard','pillow'])
+
+import base64
 import keyboard
-import random
-from PIL import Image
-from pystray import MenuItem as item,Menu as mu
+import pickle
+import pyglet
 import pystray
 import threading
 import traceback
-import pickle
-import base64
 import os
+import random
+
+from functools import lru_cache
+from fontTools.ttLib import TTFont
+from PIL import Image,ImageTk
+from pystray import MenuItem as item,Menu as mu
+from tkinter import *
+from tkinter import font
+from tkinter.ttk import *
+from typing import *
 
 KEYCOLOR='#FFFFFF'
+LINKCOLOR='#FFFFFF'
 fuchsia = '#0A0F0C'
 key_trans={'up':'↑','down':'↓','left':'←','right':'→','backspace':'BackSpace',
            'alt':'Alt','right alt':'Alt','ctrl':'Ctrl','right ctrl':'Ctrl',
@@ -40,15 +45,30 @@ class Color:
     def randomColor(self):
         return self._randomColor()
     
+    def hex_to_rgb(self,hex_color):
+        hex_color = hex_color.lstrip('#')
+        rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        return rgb
+
+    def rgb_to_hex(self,rgb):
+        return '#{:02x}{:02x}{:02x}'.format(rgb[0], rgb[1], rgb[2])
+    
     def _randomColor(self):
         R=random.randint(0,255)
         G=random.randint(0,255)
         B=random.randint(0,255)
-        _rgb='#'+hex(R)[2:].zfill(2)+hex(G)[2:].zfill(2)+hex(B)[2:].zfill(2)
+        _rgb=self.rgb_to_hex((R,G,B))
         if _rgb==fuchsia:
             return self._randomColor()
         return _rgb
     
+    def minusColor(self,color,m):
+        color=self.hex_to_rgb(color)
+        new_r=max(0,color[0]-m)
+        new_g=max(0,color[1]-m)
+        new_b=max(0,color[2]-m)
+        return self.rgb_to_hex((new_r,new_g,new_b))        
+        
     @property
     def randomColorSpecial(self):
         return random.choice(['#442335','#6D4E60','#8C6A86'])
@@ -107,10 +127,77 @@ class KeyFont:
         else:
             os.mkdir(cls.path)
 
+class KeyLine:
+    width=0
+    height=0
+    @classmethod    
+    def setSize(cls,width,height):
+        cls.width=width
+        cls.height=height
+
+    @classmethod
+    @lru_cache(None)
+    def line_points(cls,x1, y1, x2, y2,gap=2):
+        points = []
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        x, y = x1, y1
+        sx = -1 if x1 > x2 else 1
+        sy = -1 if y1 > y2 else 1
+        if dx > dy:
+            err = dx / 2.0
+            while x != x2:
+                if 0<=x<=cls.width-1 and 0<=y<=cls.height-1:
+                    if x%gap==0 and y%gap==0:
+                        points.append((x, y))
+                err -= dy
+                if err < 0:
+                    y += sy
+                    err += dx
+                x += sx
+        else:
+            err = dy / 2.0
+            while y != y2:
+                if 0<=x<=cls.width-1 and 0<=y<=cls.height-1:
+                    if x%gap==0 and y%gap==0:
+                        points.append((x, y))
+                err -= dx
+                if err < 0:
+                    x += sx
+                    err += dy
+                y += sy
+        if 0<=x<=cls.width-1 and 0<=y<=cls.height-1:
+            if x%gap==0 and y%gap==0:
+                points.append((x, y))
+        return points
+
+class KeyLink:
+    def __init__(self,pos1,pos2,life,offset,color=LINKCOLOR,outcolor=LINKCOLOR,size=2,gap=1):
+        self.life=life
+        self.max_life=life
+        self.color=color
+        self.outcolor=outcolor
+        self.size=size
+        self.points=KeyLine.line_points(pos1[0]+offset[0],pos1[1]+offset[1],pos2[0]+offset[0],pos2[1]+offset[1],gap=gap)
+        self.len=len(self.points)
+        self.disapear=False
+        
+    def __repr__(self):
+        return str(self.life)
+        
+    def update(self):
+        self.life-=2
+        if self.life<=0:
+            self.disapear=True
+    def getPoint(self):
+        return self.points[max(0,int(self.life/self.max_life*self.len)-1):int(self.life/self.max_life*self.len)]
+
 class KeyObj:
-    def __init__(self,root,pos,key,color=KEYCOLOR,move=2,loss=8,rsize=8):
+    def __init__(self,root,pos,key,color=KEYCOLOR,move=2,loss=8,rsize=8,key_type='normal'):
         self.root=root
+        self.key_type=key_type
         self.pos=pos
+        self.original_pos=pos
         self.key=self.keyTrans(key)
         self.transparency=255
         if color=='random':
@@ -125,6 +212,9 @@ class KeyObj:
         self.move=move
         self.loss=loss
         self.build()
+        
+    def getLife(self):
+        return self.transparency//self.loss
         
     def keyTrans(self,key):
         if key in key_trans:
@@ -253,7 +343,6 @@ class KeyboardPos:
                       'down':(1453,985),
                       'right':(1550,985),
                       }
-        # self.key_pos={}
     def __getitem__(self,i):
         if i in self.key_pos:
             return self.key_pos[i],False
@@ -270,9 +359,13 @@ class TableMan:
         self.screen_height = None
         self.x_offset=-500
         self.y_offset=-400
-        self.objs=[]
+        self.objs:List[KeyObj]=[]
         self.easterEgg=[]
         self.enabled_status=True
+        self.linkBottom=3
+        self.links:List[KeyLink]=[]
+        self.key_trace=False
+        self.linkRandomColor=False
         
     def offset(self,pos,offset=True):
         if offset:
@@ -320,9 +413,13 @@ class TableMan:
         self.root.resizable(0,0)
         self.root.attributes('-topmost',True)
         self.root.attributes('-transparentcolor',fuchsia)
+        
+        self.root.attributes('-alpha',0.7)
+        
         self.table=Canvas(self.root,width=self.screen_width,height=self.screen_height,highlightthickness=0,bg=fuchsia)
         self.table.pack(fill=BOTH)
-        
+
+        KeyLine.setSize(self.screen_width,self.screen_height)
         KeyFont.loadLocalFont()
         
         image=pickle.loads(base64.b64decode((self.iconPic().encode())))
@@ -340,6 +437,10 @@ class TableMan:
         for f in KeyFont.getFontList():
             self.menu.append(item('字体:'+str(f),self.setFont_wrap(f)))
         self.menu.append(mu.SEPARATOR)
+        self.menu.append(item('关闭键盘轨迹',self.key_trace_off))
+        self.menu.append(item('白色键盘轨迹',self.key_trace_on))
+        self.menu.append(item('彩色键盘轨迹',self.key_trace_on_color))
+        self.menu.append(mu.SEPARATOR)
         self.menu.append(item('是否生效',self.enabled_switch))
         self.menu.append(mu.SEPARATOR)
         self.menu.append(item('退出',self.quit_window))
@@ -350,6 +451,29 @@ class TableMan:
 
         self.root.after(10,self.update)
         self.root.mainloop()
+        
+    def key_trace_off(self,*event):
+        self.key_trace=False
+        self.linkRandomColor=False
+        
+    def key_trace_on(self,*event):
+        self.key_trace=True
+        self.linkRandomColor=False
+        
+    def key_trace_on_color(self,*event):
+        self.key_trace=True
+        self.linkRandomColor=True
+        
+    def paint(self):
+        self.table.delete('all')
+        for link in self.links:
+            points=link.getPoint()
+            for x,y in points:
+                # self.table.create_rectangle(x,y,x+link.size,y+link.size,fill=link.color,outline=link.color)
+                size=link.size
+                self.table.create_polygon((x-size*2,y),(x,y-size*2),(x+size*2,y),(x,y+size*2),fill=link.color,outline=link.color)
+                
+        self.table.update()
         
     def enabled_switch(self):
         self.enabled_status=not self.enabled_status
@@ -398,6 +522,16 @@ class TableMan:
                 removeobj.append(obj)
         for obj in removeobj:
             self.objs.remove(obj)
+        
+        if self.key_trace:
+            removelink=[]
+            for link in self.links:
+                link.update()
+                if link.disapear:
+                    removelink.append(link)
+            for link in removelink:
+                self.links.remove(link)         
+            self.paint()
         self.root.after(10,self.update)
         
     def keyBoardEvent(self,key):
@@ -411,9 +545,19 @@ class TableMan:
                         self.objs.append(KeyObj(self.root,self.offset(*self.key_pos[key]),key,KEYCOLOR))
                 else:
                     self.objs.append(KeyObj(self.root,self.offset(*self.key_pos[key]),key,KEYCOLOR))
+                self.linkKeyEvent()
         except:
             with open('error.log','a+') as f:
                 traceback.print_exc(file=f)
+    
+    def linkKeyEvent(self):
+        if len(self.objs)>1:
+            if self.objs[-2].key_type=='normal':
+                _diff=min(self.objs[-1].getLife(),self.objs[-2].getLife())
+                if _diff>=self.linkBottom and self.objs[-1].key!=self.objs[-2].key:
+                    link=KeyLink(self.objs[-1].original_pos,self.objs[-2].original_pos,_diff,(self.objs[-1].size*self.objs[-1].rsize//2,self.objs[-1].size*3//2),size=1,gap=1,color=colorObject.randomColor if self.linkRandomColor else LINKCOLOR)
+                    if self.key_trace:
+                        self.links.append(link)
     
     def easterEggTrigger(self,types):
         s=''
@@ -421,7 +565,7 @@ class TableMan:
             s='♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥♥'
         elif types==2:
             s='你已获得无敌!'
-        self.objs.append(KeyObj(self.root,(self.screen_width//2-1000,self.screen_height//2),s,KEYCOLOR if types!=1 else '#FF0000',move=1,loss=1,rsize=64))
+        self.objs.append(KeyObj(self.root,(self.screen_width//2-1000,self.screen_height//2),s,KEYCOLOR if types!=1 else '#FF0000',move=1,loss=1,rsize=64,key_type='spec'))
     
     def easterEggQueue(self,key):
         if key in ['up','down','left','right','b','B','a','A','w','h','o','i','s','y','u','r','d']:
